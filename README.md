@@ -278,6 +278,11 @@ Your config, logs and backups are kept.
 * Apply-fix is chat-driven (patch shown first, applied on confirm). There is no one-key apply yet.
 * Neovim is not supported (Vim 9 channel/textprop APIs).
 
+## Vim productivity guide
+
+New to the keybindings in the companion `.vimrc` (fzf file finding, project grep, ctags jumps,
+running Claude from inside Vim)? See [`vimrc-guide.md`](vimrc-guide.md).
+
 ## Development
 
 ```bash

@@ -139,17 +139,25 @@ fi
 
 # ---- AI mode ----
 s="$(session_name "$root")"
-if tmux has-session -t "=$s" 2>/dev/null; then
-  if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$s"; else exec tmux attach -t "=$s"; fi
-fi
 sd="$(session_dir "$s")"
+if tmux has-session -t "=$s" 2>/dev/null; then
+  vp="$(tmux show-options -t "=$s" -v @vimai_vim 2>/dev/null || true)"
+  if [ -n "$vp" ] && tmux list-panes -s -t "=$s" -F '#{pane_id}' | grep -qx -- "$vp"; then
+    if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$s"; else exec tmux attach -t "=$s"; fi
+  fi
+  # Vim pane is gone (e.g. cleanup failed): replace the orphaned agents with a fresh workspace
+  echo "vdev: previous workspace for this project had no Vim pane; starting a fresh one" >&2
+  case "$sd" in */vim-ai/vdev-*) rm -rf -- "$sd" ;; esac
+  tmux kill-session -t "=$s" 2>/dev/null || true
+fi
 mkdir -p -m 700 "$(dirname "$sd")" "$sd"
 "$HERE/vim-ai-bridge" --print-config >"$sd/config.json"
 mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/vim-ai"
 
 cols="$(tput cols 2>/dev/null || echo 200)"; rows="$(tput lines 2>/dev/null || echo 50)"
 q() { printf '%q' "$1"; }
-vimcmd="cd $(q "$root") && vim $(q "$open"); $(q "$HERE/vdev") --cleanup $(q "$s")"
+# On Vim exit, tear down the workspace with plain tmux/rm (no dependency on where vdev lives).
+vimcmd="cd $(q "$root") && vim $(q "$open"); rm -rf -- $(q "$sd"); tmux kill-session -t $(q "=$s")"
 vp="$(tmux new-session -d -s "$s" -x "$cols" -y "$rows" -c "$root" -P -F '#{pane_id}' \
   -e VIM_AI_ENABLED=1 -e "VIM_AI_SESSION=$s" -e "VIM_AI_SESSION_DIR=$sd" -e "VIM_AI_ROOT=$root" \
   -e "PATH=$HERE:$PATH" "$vimcmd")"
