@@ -406,7 +406,8 @@ class Bridge:
                 ranges_desc = ", ".join(f"{a}-{b}" if a != b else str(a) for a, b in ranges[:6])
 
             await self.push({"type": "status", "state": "reviewing", "file": file})
-            self.say(f"{C['d']}⟳ {mode:5} {rel}  [{ranges_desc}]{C['x']}")
+            why = f" ({req['reason']})" if req.get("reason") else ""
+            self.say(f"{C['d']}⟳ {mode:5} {rel}{why}  [{ranges_desc}]{C['x']}")
             self.log.info("review started mode=%s file=%s", mode, rel)
             async with self.sem:
                 raw = await self.run_backend(prompt, mode)

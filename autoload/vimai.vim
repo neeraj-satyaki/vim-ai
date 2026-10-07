@@ -39,6 +39,10 @@ function! vimai#setup() abort
     endif
   endfor
   call sign_define('VimAIEdit', {'text': '▎', 'texthl': 'VimAIEditSign', 'linehl': 'VimAIEditLine'})
+  if empty(prop_type_get('VimAIEditProp'))
+    " text-prop highlight survives on lines where a review sign outranks the edit sign
+    call prop_type_add('VimAIEditProp', {'highlight': 'VimAIEditLine', 'priority': -10})
+  endif
   augroup vimai
     autocmd!
     " vim-ai reloads changed files itself (same auto-reload as 'autoread', plus change
@@ -46,7 +50,7 @@ function! vimai#setup() abort
     autocmd BufReadPost,BufNewFile * setlocal noautoread
     autocmd FileChangedShell * call s:on_fcs()
     autocmd FileChangedShellPost * call s:on_fcs_post()
-    autocmd InsertEnter * call sign_unplace('vimai_edit', {'buffer': bufnr()})
+    autocmd InsertEnter * call s:clear_edit_marks(bufnr())
     autocmd TextChanged,TextChangedI,TextChangedP * call s:on_change()
     autocmd CursorMoved,CursorMovedI * call s:on_move()
     autocmd BufWritePost * call s:on_save()
@@ -101,7 +105,7 @@ function! s:highlights() abort
   hi default VimAIWarnVirt  ctermfg=214 cterm=italic guifg=#e5a50a gui=italic
   hi default VimAIInfoVirt  ctermfg=244 cterm=italic guifg=#7f848e gui=italic
   hi default VimAIEditSign  ctermfg=214 guifg=#FCA719
-  hi default VimAIEditLine  ctermbg=236 guibg=#2a2617
+  hi default VimAIEditLine  ctermbg=58 guibg=#4a3b10
 endfunction
 
 function! s:map(key, rhs) abort
@@ -213,11 +217,13 @@ endfunction
 
 " -------------------------------------------------------------- triggers ----
 function! s:reviewable(...) abort
-  let file = expand('%:p')
+  " optional args: manual (echo reason), buf (default: current)
+  let buf = a:0 > 1 ? a:2 : bufnr()
+  let file = fnamemodify(bufname(buf), ':p')
   let why = ''
-  if !empty(&buftype) || empty(file)
+  if !empty(getbufvar(buf, '&buftype')) || empty(bufname(buf))
     let why = 'not a file buffer'
-  elseif line('$') > s:cfg.max_file_lines
+  elseif len(getbufline(buf, 1, '$')) > s:cfg.max_file_lines
     let why = 'file too large'
   else
     for re in s:ignore_re
@@ -265,21 +271,25 @@ function! s:on_enter() abort
   if has_key(s:findings, f) | call s:render(bufnr(), f) | endif
 endfunction
 
-function! vimai#review(mode, manual) abort
+" vimai#review(mode, manual [, buf [, reason]])
+function! vimai#review(mode, manual, ...) abort
+  let buf = a:0 ? a:1 : bufnr()
   if s:ws_off
     if a:manual | echo 'AI: workspace agents are off (:AIWorkspaceEnable)' | endif
     return
   endif
-  if a:mode !=# 'diff' && !s:reviewable(a:manual)
+  if a:mode !=# 'diff' && !s:reviewable(a:manual, buf)
     return
   endif
   if a:mode ==# 'idle' && !a:manual && mode() =~# '^[vVs\x16]'
     return  " don't review mid-selection
   endif
-  let msg = {'type': 'review', 'mode': a:mode, 'file': a:mode ==# 'diff' ? '' : expand('%:p'),
-        \ 'filetype': &filetype, 'tick': b:changedtick, 'cursor': [line('.'), col('.')], 'manual': a:manual}
+  let cur = buf == bufnr() ? [line('.'), col('.')] : [get(getbufinfo(buf)[0], 'lnum', 1), 1]
+  let msg = {'type': 'review', 'mode': a:mode, 'file': a:mode ==# 'diff' ? '' : fnamemodify(bufname(buf), ':p'),
+        \ 'filetype': getbufvar(buf, '&filetype'), 'tick': getbufvar(buf, 'changedtick'), 'cursor': cur,
+        \ 'manual': a:manual, 'reason': a:0 > 1 ? a:2 : ''}
   if a:mode !=# 'diff'
-    let msg.lines = getline(1, '$')
+    let msg.lines = getbufline(buf, 1, '$')
   endif
   if s:send(msg)
     let s:state = 'reviewing'
@@ -426,7 +436,7 @@ function! vimai#clear() abort
   endfor
   let s:findings = {}
   for b in getbufinfo({'bufloaded': 1})
-    call sign_unplace('vimai_edit', {'buffer': b.bufnr})
+    call s:clear_edit_marks(b.bufnr)
   endfor
   call s:update_qf()
   redrawstatus!
@@ -573,11 +583,14 @@ endfunction
 
 function! s:mark_edits(buf, file, ranges, who) abort
   if !get(s:cfg, 'show_agent_edits', 1) | return | endif
-  call sign_unplace('vimai_edit', {'buffer': a:buf})
-  let n = len(getbufline(a:buf, 1, '$'))
+  call s:clear_edit_marks(a:buf)
+  let lines = getbufline(a:buf, 1, '$')
   for [a, b] in a:ranges
-    for l in range(a, min([b, a + 300, n]))
+    for l in range(a, min([b, a + 300, len(lines)]))
       call sign_place(0, 'vimai_edit', 'VimAIEdit', a:buf, {'lnum': l, 'priority': 15})
+      if !empty(lines[l - 1])
+        call prop_add(l, 1, {'bufnr': a:buf, 'type': 'VimAIEditProp', 'length': strlen(lines[l - 1])})
+      endif
     endfor
   endfor
   if empty(a:ranges) | return | endif
@@ -585,9 +598,18 @@ function! s:mark_edits(buf, file, ranges, who) abort
   if get(s:cfg, 'agent_edit_follow', 1) && wid != -1 && mode() !~# '^[iRc]'
     call win_execute(wid, 'call cursor(' . a:ranges[0][0] . ', 1) | normal! zz')
   endif
+  if s:auto_ok() && get(s:cfg, 'review_agent_edits', 1) && !getbufvar(a:buf, '&modified')
+    " review everything uncommitted in this file (the agent's edit + yours), like :w
+    call vimai#review('save', 0, a:buf, empty(a:who) ? 'external change' : a:who . ' edit')
+  endif
   let spans = map(copy(a:ranges[:3]), {_, r -> r[0] == r[1] ? r[0] : r[0] . '-' . r[1]})
   echo '✎ ' . (empty(a:who) ? 'Updated on disk' : a:who . ' edited') . ': '
         \ . fnamemodify(a:file, ':~:.') . (len(a:ranges) == 1 && a:ranges[0][0] == a:ranges[0][1] ? ' line ' : ' lines ') . join(spans, ', ') . (len(a:ranges) > 4 ? ' …' : '')
+endfunction
+
+function! s:clear_edit_marks(buf) abort
+  call sign_unplace('vimai_edit', {'buffer': a:buf})
+  call prop_remove({'type': 'VimAIEditProp', 'bufnr': a:buf, 'all': 1})
 endfunction
 
 " Agent (chat) edit reported by the PostToolUse hook via the bridge.
@@ -605,28 +627,47 @@ function! s:on_agent_edit(msg) abort
     return
   endif
   let buf = s:buf_for(file)
+  let how = get(s:cfg, 'agent_edit_open', 'full')
   if buf != -1
     let s:agent_files[file] = a:msg
     execute 'checktime' buf
+    if bufwinid(buf) == -1 && how !=# 'none'
+      call s:show_full(file, how)  " loaded but not visible: bring it on screen
+    endif
     if has_key(s:agent_files, file)  " already reloaded by the poller: just re-label/mark
       call remove(s:agent_files, file)
       call s:mark_edits(buf, file, get(a:msg, 'ranges', []), get(a:msg, 'agent', 'Agent'))
     endif
     return
   endif
-  let how = get(s:cfg, 'agent_edit_open', 'preview')
   if how ==# 'none' | return | endif
-  let cur = win_getid()
-  if how ==# 'split'
-    execute 'split ' . fnameescape(file)
-  else
-    execute 'silent pedit ' . fnameescape(file)
-  endif
-  call win_gotoid(cur)  " focus stays where the user was
+  call s:show_full(file, how)
   let buf = s:buf_for(file)
   if buf != -1
     call s:mark_edits(buf, file, get(a:msg, 'ranges', []), get(a:msg, 'agent', 'Agent'))
   endif
+endfunction
+
+" Show the whole edited file. 'full' = main editor window (previous file stays
+" one Ctrl-^ away; unsaved buffers are hidden, never lost), 'split', 'preview'.
+function! s:show_full(file, how) abort
+  if a:how ==# 'preview'
+    let cur = win_getid()
+    execute 'silent pedit ' . fnameescape(a:file)
+    call win_gotoid(cur)
+    return
+  endif
+  " pick the main editing window: current if it is a normal file window
+  if !empty(&buftype) || &previewwindow
+    for w in getwininfo()
+      if empty(getbufvar(w.bufnr, '&buftype')) && !getwinvar(w.winid, '&previewwindow')
+        call win_gotoid(w.winid)
+        break
+      endif
+    endfor
+  endif
+  execute (a:how ==# 'split' ? 'split ' : 'hide edit ') . fnameescape(a:file)
+  setlocal noautoread
 endfunction
 
 function! s:flush_edits() abort

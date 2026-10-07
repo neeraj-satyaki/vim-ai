@@ -71,8 +71,8 @@ Requirements: Vim 9 (`+channel +job +timers +textprop +popupwin`), tmux ≥ 3.0,
 [Claude Code](https://claude.com/claude-code). Recommended: [opencode](https://opencode.ai) for free idle reviews.
 
 ```bash
-git clone https://github.com/neeraj-satyaki/vim-ai.git ~/vim-ai
-cd ~/vim-ai && ./install.sh
+git clone https://github.com/neeraj-satyaki/vim-ai.git
+cd vim-ai && ./install.sh
 ```
 
 The installer:
@@ -166,12 +166,16 @@ Watch agents change your code as it happens:
   file, nothing is overwritten. You get a warning instead (`:e!` loads theirs, `:w` keeps yours).
 * **Agent edit feed.** When the chat agent uses Edit/Write, Claude Code hooks snapshot the file before
   and after. The review pane prints a coloured diff, for example `✎ Claude edited src/worker.ts +2 -1`.
-* **Files you don't have open** are shown in Vim's preview window with the new lines marked. Your
-  cursor and window stay where they were. Close it with `:pclose`.
+* **Files that aren't on screen** open full height in your main editor window, every line of the
+  file, with the edited lines highlighted in gold and the view on the first change. Your previous
+  file is one `Ctrl-^` away, and unsaved buffers are hidden, never lost. Nothing moves while you are typing.
+* **Claude's edits are reviewed too.** After an agent (or any external tool) changes a file, the review
+  agent runs a deep review of all uncommitted changes in it, the agent's and yours. Findings appear
+  as usual (signs, virtual text, quickfix, `]a`).
 * Marks clear when you start typing in that buffer, or with `:AIClear`. Nothing moves while you are in insert mode.
 
 Config: `show_agent_edits`, `agent_edit_follow` (scroll to changes), `agent_edit_open`
-(`preview` | `split` | `none`), `agent_edit_diff_lines`, `external_change_poll_ms`.
+(`full` | `split` | `preview` | `none`), `review_agent_edits`, `agent_edit_diff_lines`, `external_change_poll_ms`.
 
 ## Vim commands
 
@@ -216,7 +220,7 @@ Common keys:
   "opencode_model": "opencode/mimo-v2.6-flash-free",
   "idle_model": "haiku", "deep_model": "sonnet",
   "show_insights": true, "show_virtual_text": true,
-  "show_agent_edits": true, "agent_edit_follow": true, "agent_edit_open": "preview",
+  "show_agent_edits": true, "agent_edit_follow": true, "agent_edit_open": "full", "review_agent_edits": true,
   "right_pane_percent": 28, "review_pane_percent": 55,
   "mappings": { "next": "]a", "prev": "[a" },
   "ignore": ["*/node_modules/*", "..."],
@@ -261,7 +265,7 @@ Code, prompts and secrets are never logged.
 ## Uninstall
 
 ```bash
-~/vim-ai/uninstall.sh      # removes only the symlinks it created
+./uninstall.sh             # from the repo; removes only the symlinks it created
 ```
 
 Your config, logs and backups are kept.
