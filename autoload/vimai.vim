@@ -17,6 +17,10 @@ let s:last_sel = {}
 let s:last_func = {}
 let s:branch = {}
 let s:log_n = 0
+let s:fcs_old = {}         " bufnr -> lines before an on-disk change
+let s:agent_files = {}     " file -> agent edit msg awaiting reload
+let s:recent_agent = {}    " file -> localtime() of last agent edit
+let s:deferred_edits = []
 let s:state_dir = (empty($XDG_STATE_HOME) ? $HOME . '/.local/state' : $XDG_STATE_HOME) . '/vim-ai'
 let s:sev = {'ERROR': ['E', '✖', 'VimAIError'], 'WARNING': ['W', '⚠', 'VimAIWarn'],
       \ 'INSIGHT': ['I', 'ℹ', 'VimAIInfo'], 'GOOD': ['I', '✓', 'VimAIInfo']}
@@ -34,14 +38,21 @@ function! vimai#setup() abort
       call prop_type_add('VimAIVirt' . name, {'highlight': v[2] . 'Virt'})
     endif
   endfor
+  call sign_define('VimAIEdit', {'text': '▎', 'texthl': 'VimAIEditSign', 'linehl': 'VimAIEditLine'})
   augroup vimai
     autocmd!
+    " vim-ai reloads changed files itself (same auto-reload as 'autoread', plus change
+    " marks); buffer-local so the user's global setting is untouched.
+    autocmd BufReadPost,BufNewFile * setlocal noautoread
+    autocmd FileChangedShell * call s:on_fcs()
+    autocmd FileChangedShellPost * call s:on_fcs_post()
+    autocmd InsertEnter * call sign_unplace('vimai_edit', {'buffer': bufnr()})
     autocmd TextChanged,TextChangedI,TextChangedP * call s:on_change()
     autocmd CursorMoved,CursorMovedI * call s:on_move()
     autocmd BufWritePost * call s:on_save()
     autocmd BufEnter * call s:on_enter()
     autocmd ModeChanged * if v:event.old_mode =~# '^[vV\x16]' | call timer_start(0, {-> s:save_selection()}) | endif
-    autocmd InsertLeave * call s:flush_nav() | if b:changedtick != get(b:, 'vimai_seen_tick', -1) | call s:on_change() | endif
+    autocmd InsertLeave * call s:flush_nav() | call s:flush_edits() | if b:changedtick != get(b:, 'vimai_seen_tick', -1) | call s:on_change() | endif
     autocmd ColorScheme * call s:highlights()
     autocmd VimLeavePre * call s:disconnect()
   augroup END
@@ -59,6 +70,12 @@ function! vimai#setup() abort
     set statusline=%<%f\ %h%m%r%=%{VimAIStatus()}\ \ %-14.(%l,%c%V%)\ %P
   elseif &statusline !~# 'VimAIStatus'
     let &statusline .= ' %{VimAIStatus()}'
+  endif
+  for b in getbufinfo({'bufloaded': 1})
+    call setbufvar(b.bufnr, '&autoread', 0)
+  endfor
+  if get(s:cfg, 'external_change_poll_ms', 1000) > 0
+    call timer_start(s:cfg.external_change_poll_ms, {-> s:poll()}, {'repeat': -1})
   endif
   call s:connect_retry(20)
 endfunction
@@ -83,6 +100,8 @@ function! s:highlights() abort
   hi default VimAIErrorVirt ctermfg=203 cterm=italic guifg=#e06c75 gui=italic
   hi default VimAIWarnVirt  ctermfg=214 cterm=italic guifg=#e5a50a gui=italic
   hi default VimAIInfoVirt  ctermfg=244 cterm=italic guifg=#7f848e gui=italic
+  hi default VimAIEditSign  ctermfg=214 guifg=#FCA719
+  hi default VimAIEditLine  ctermbg=236 guibg=#2a2617
 endfunction
 
 function! s:map(key, rhs) abort
@@ -155,6 +174,8 @@ function! s:on_close(ch) abort
   let s:state = 'offline'
   call s:log('bridge closed connection')
   redrawstatus!
+  let s:last_try = 0
+  call timer_start(1500, {-> s:connect_retry(30)})  " bridge restarted: reconnect proactively
 endfunction
 
 function! s:send(msg) abort
@@ -182,6 +203,8 @@ function! s:on_msg(ch, msg) abort
       redrawstatus!
     elseif t ==# 'navigate'
       call s:navigate(a:msg)
+    elseif t ==# 'agent_edit'
+      call s:on_agent_edit(a:msg)
     endif
   catch
     call s:log('message handling error: ' . v:exception . ' @ ' . v:throwpoint)
@@ -402,6 +425,9 @@ function! vimai#clear() abort
     if b != -1 | call s:render(b, file) | endif
   endfor
   let s:findings = {}
+  for b in getbufinfo({'bufloaded': 1})
+    call sign_unplace('vimai_edit', {'buffer': b.bufnr})
+  endfor
   call s:update_qf()
   redrawstatus!
 endfunction
@@ -470,6 +496,145 @@ function! s:flush_nav() abort
     let s:pending_nav = {}
     call timer_start(0, {-> s:goto(n.file, n.line, n.col)})
   endif
+endfunction
+
+" ------------------------------------------------- live file updates ----
+" Any open file changed on disk (agent, opencode, git, another editor) is
+" reloaded automatically and its changed lines are marked. Unsaved edits are
+" never overwritten.
+function! s:poll() abort
+  if mode() ==# 'n' && getcmdwintype() ==# ''
+    silent! checktime
+  endif
+endfunction
+
+function! s:on_fcs() abort
+  let buf = str2nr(expand('<abuf>'))
+  let name = fnamemodify(bufname(buf), ':~:.')
+  if v:fcs_reason ==# 'deleted' || v:fcs_reason ==# 'mode' || v:fcs_reason ==# 'time'
+    let v:fcs_choice = ''
+    return
+  endif
+  if v:fcs_reason ==# 'conflict' || getbufvar(buf, '&modified')
+    let v:fcs_choice = ''
+    echohl WarningMsg
+    echo 'AI: ' . name . ' changed on disk but you have unsaved edits — :e! to load it, :w to keep yours'
+    echohl None
+    return
+  endif
+  let s:fcs_old[buf] = getbufline(buf, 1, '$')
+  let v:fcs_choice = 'reload'
+endfunction
+
+function! s:on_fcs_post() abort
+  let buf = str2nr(expand('<abuf>'))
+  if !has_key(s:fcs_old, buf) | return | endif
+  let old = remove(s:fcs_old, buf)
+  let new = getbufline(buf, 1, '$')
+  let file = fnamemodify(bufname(buf), ':p')
+  let [ranges, diff, added, removed] = s:diff(old, new, fnamemodify(file, ':.'))
+  let msg = has_key(s:agent_files, file) ? get(remove(s:agent_files, file), 'agent', 'Agent') : ''  " '' = not an agent edit
+  call s:mark_edits(buf, file, ranges, msg)
+  if empty(msg) && !empty(ranges)
+    " external change -> pane diff (the bridge drops it if an agent reports the same edit)
+    if localtime() - get(s:recent_agent, file, 0) > 5
+      call s:send({'type': 'show_diff', 'agent': 'external', 'file': file, 'diff': diff,
+            \ 'added': added, 'removed': removed})
+    endif
+  endif
+endfunction
+
+" [ranges in new, unified diff text, added, removed] using the system diff.
+function! s:diff(old, new, label) abort
+  let [a, b] = [tempname(), tempname()]
+  try
+    call writefile(a:old, a)
+    call writefile(a:new, b)
+    let normal = systemlist('diff ' . shellescape(a) . ' ' . shellescape(b))
+    let unified = system('diff -U2 --label a/' . shellescape(a:label) . ' --label b/' . shellescape(a:label)
+          \ . ' ' . shellescape(a) . ' ' . shellescape(b))
+  finally
+    call delete(a)
+    call delete(b)
+  endtry
+  let ranges = []
+  let [added, removed] = [0, 0]
+  for l in normal
+    let m = matchlist(l, '^\v(\d+)%(,(\d+))?([acd])(\d+)%(,(\d+))?$')
+    if !empty(m)
+      let [s, e] = [str2nr(m[4]), str2nr(empty(m[5]) ? m[4] : m[5])]
+      call add(ranges, m[3] ==# 'd' ? [max([1, s]), max([1, s])] : [s, e])
+    elseif l =~# '^>' | let added += 1
+    elseif l =~# '^<' | let removed += 1
+    endif
+  endfor
+  return [ranges, unified, added, removed]
+endfunction
+
+function! s:mark_edits(buf, file, ranges, who) abort
+  if !get(s:cfg, 'show_agent_edits', 1) | return | endif
+  call sign_unplace('vimai_edit', {'buffer': a:buf})
+  let n = len(getbufline(a:buf, 1, '$'))
+  for [a, b] in a:ranges
+    for l in range(a, min([b, a + 300, n]))
+      call sign_place(0, 'vimai_edit', 'VimAIEdit', a:buf, {'lnum': l, 'priority': 15})
+    endfor
+  endfor
+  if empty(a:ranges) | return | endif
+  let wid = bufwinid(a:buf)
+  if get(s:cfg, 'agent_edit_follow', 1) && wid != -1 && mode() !~# '^[iRc]'
+    call win_execute(wid, 'call cursor(' . a:ranges[0][0] . ', 1) | normal! zz')
+  endif
+  let spans = map(copy(a:ranges[:3]), {_, r -> r[0] == r[1] ? r[0] : r[0] . '-' . r[1]})
+  echo '✎ ' . (empty(a:who) ? 'Updated on disk' : a:who . ' edited') . ': '
+        \ . fnamemodify(a:file, ':~:.') . (len(a:ranges) == 1 && a:ranges[0][0] == a:ranges[0][1] ? ' line ' : ' lines ') . join(spans, ', ') . (len(a:ranges) > 4 ? ' …' : '')
+endfunction
+
+" Agent (chat) edit reported by the PostToolUse hook via the bridge.
+function! s:on_agent_edit(msg) abort
+  let file = fnamemodify(get(a:msg, 'file', ''), ':p')
+  if !filereadable(file) | return | endif
+  let s:recent_agent[file] = localtime()
+  if mode() =~# '^[iRc]'
+    call add(s:deferred_edits, a:msg)  " never reshuffle windows while typing
+    let buf = s:buf_for(file)
+    if buf != -1 && !getbufvar(buf, '&modified')
+      let s:agent_files[file] = a:msg
+      execute 'checktime' buf
+    endif
+    return
+  endif
+  let buf = s:buf_for(file)
+  if buf != -1
+    let s:agent_files[file] = a:msg
+    execute 'checktime' buf
+    if has_key(s:agent_files, file)  " already reloaded by the poller: just re-label/mark
+      call remove(s:agent_files, file)
+      call s:mark_edits(buf, file, get(a:msg, 'ranges', []), get(a:msg, 'agent', 'Agent'))
+    endif
+    return
+  endif
+  let how = get(s:cfg, 'agent_edit_open', 'preview')
+  if how ==# 'none' | return | endif
+  let cur = win_getid()
+  if how ==# 'split'
+    execute 'split ' . fnameescape(file)
+  else
+    execute 'silent pedit ' . fnameescape(file)
+  endif
+  call win_gotoid(cur)  " focus stays where the user was
+  let buf = s:buf_for(file)
+  if buf != -1
+    call s:mark_edits(buf, file, get(a:msg, 'ranges', []), get(a:msg, 'agent', 'Agent'))
+  endif
+endfunction
+
+function! s:flush_edits() abort
+  let pending = s:deferred_edits
+  let s:deferred_edits = []
+  for m in pending
+    call timer_start(0, {-> s:on_agent_edit(m)})
+  endfor
 endfunction
 
 " ------------------------------------------------------------- context ----

@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Claude Code Pre/PostToolUse hook: show agent file edits live in the workspace.
+
+  pre  -> snapshot the file the agent is about to edit
+  post -> diff snapshot vs new content, send {"type":"agent_edit"} to the bridge
+          (review pane prints the diff; Vim reloads + highlights the changed lines)
+
+Never blocks or fails the agent: any error exits 0 silently.
+"""
+import difflib
+import hashlib
+import json
+import os
+import socket
+import sys
+
+
+def changed_ranges(old, new):
+    out = []
+    for tag, _a, _b, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if tag != "equal" and new:
+            out.append([j1 + 1, max(j1 + 1, min(j2, len(new)))])
+    return out
+
+
+def main():
+    phase = sys.argv[1] if len(sys.argv) > 1 else ""
+    sd = os.environ.get("VIM_AI_SESSION_DIR")
+    ev = json.load(sys.stdin)
+    ti = ev.get("tool_input") or {}
+    path = ti.get("file_path") or ti.get("notebook_path")
+    if not sd or not path:
+        return
+    path = os.path.abspath(os.path.join(ev.get("cwd") or os.getcwd(), path))
+    snapdir = os.path.join(sd, "snapshots")
+    snap = os.path.join(snapdir, hashlib.sha1(path.encode()).hexdigest())
+    if phase == "pre":
+        os.makedirs(snapdir, mode=0o700, exist_ok=True)
+        try:
+            with open(path, "rb") as f:
+                data = f.read(4_000_000)
+        except FileNotFoundError:
+            data = b"\0__absent__"
+        with open(snap, "wb") as f:
+            f.write(data)
+        return
+    if phase != "post":
+        return
+    try:
+        with open(snap, "rb") as f:
+            raw = f.read()
+        os.unlink(snap)
+    except FileNotFoundError:
+        raw = b""
+    created = raw == b"\0__absent__"
+    old = [] if created else raw.decode("utf-8", "replace").splitlines()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            new = f.read().splitlines()
+    except OSError:
+        return
+    if old == new:
+        return
+    root = os.environ.get("VIM_AI_ROOT") or os.getcwd()
+    rel = os.path.relpath(path, root)
+    diff = list(difflib.unified_diff(old, new, f"a/{rel}", f"b/{rel}", n=2, lineterm=""))
+    msg = {
+        "type": "agent_edit", "agent": os.environ.get("VIM_AI_AGENT", "Claude"), "file": path,
+        "created": created, "ranges": changed_ranges(old, new),
+        "added": sum(1 for d in diff if d.startswith("+") and not d.startswith("+++")),
+        "removed": sum(1 for d in diff if d.startswith("-") and not d.startswith("---")),
+        "diff": "\n".join(diff[:400]),
+    }
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(2)
+    s.connect(os.path.join(sd, "bridge.sock"))
+    s.sendall((json.dumps(msg) + "\n").encode())
+    s.makefile().readline()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # a display helper must never break the agent
+        pass
+    sys.exit(0)

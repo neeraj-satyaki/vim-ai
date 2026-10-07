@@ -227,6 +227,7 @@ class Bridge:
         self.cache = {}          # key -> (time, findings)
         self.last_auto = {}      # file -> time of last automatic idle review (cooldown)
         self.deferred = {}       # file -> latest request waiting out the cooldown
+        self.last_agent_edit = {}  # file -> time an agent reported editing it
         self.sem = asyncio.Semaphore(cfg["max_concurrent_reviews"])
         self.prompt = open(os.path.join(REPO, "prompts", "reviewer.md")).read()
 
@@ -276,6 +277,16 @@ class Bridge:
                     self.submit(msg)
                 elif t == "cancel":
                     self.cancel(msg.get("file", ""), "cancel requested")
+                elif t == "agent_edit":
+                    self.last_agent_edit[msg.get("file")] = time.time()
+                    self.show_edit(msg)
+                    fwd = {k: msg.get(k) for k in ("type", "agent", "file", "ranges", "added", "removed", "created")}
+                    await self.push(fwd)
+                    writer.write(b'{"ok": true}\n')
+                    await writer.drain()
+                elif t == "show_diff":  # external change detected by Vim (any tool)
+                    # wait briefly: if an agent reports the same file, its labelled diff wins
+                    asyncio.get_running_loop().call_later(2.0, self._show_external, msg, time.time())
                 elif t == "navigate":
                     ok = bool(self.vims)
                     if ok:
@@ -295,6 +306,30 @@ class Bridge:
         req = self.deferred.pop(key, None)
         if req:
             self.submit(req)
+
+    def _show_external(self, msg, seen):
+        if abs(self.last_agent_edit.get(msg.get("file"), 0) - seen) > 5:
+            self.show_edit(msg)
+
+    def show_edit(self, msg):
+        """Print an agent/external edit as a coloured diff in the review pane."""
+        if not self.cfg.get("show_agent_edits", True):
+            return
+        rel = self.rel(str(msg.get("file", "")))
+        who = msg.get("agent") or "external"
+        what = "created" if msg.get("created") else "edited"
+        head = f"External change: {rel}" if who == "external" else f"{who} {what} {rel}"
+        self.say(f"{C['o']}{C['b']}✎ {head}{C['x']}  "
+                 f"{C['g']}+{msg.get('added', 0)}{C['x']} {C['r']}-{msg.get('removed', 0)}{C['x']}")
+        lines = str(msg.get("diff") or "").splitlines()
+        limit = self.cfg.get("agent_edit_diff_lines", 40)
+        for d in lines[2:2 + limit] if lines[:1] and lines[0].startswith("---") else lines[:limit]:
+            col = C["g"] if d.startswith("+") else C["r"] if d.startswith("-") else C["c"] if d.startswith("@@") else C["d"]
+            self.say(f"  {col}{d}{C['x']}")
+        if len(lines) > limit + 2:
+            self.say(f"  {C['d']}… {len(lines) - limit - 2} more diff lines{C['x']}")
+        self.say("")
+        self.log.info("%s %s %s (+%s -%s)", who, what, rel, msg.get("added"), msg.get("removed"))
 
     def cancel(self, file, why):
         if self.deferred.pop(file, None):

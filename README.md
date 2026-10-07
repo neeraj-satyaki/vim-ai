@@ -30,7 +30,7 @@ and two agents on the right. A **review agent** quietly reviews what you change,
 
 ## Contents
 [Architecture](#architecture) · [Install](#install) · [Launch](#launch) · [Auto-review](#auto-review) ·
-[Chat](#chat) · [Vim commands](#vim-commands) · [Mappings](#key-mappings) · [Configuration](#configuration) ·
+[Chat](#chat) · [Live edits](#live-edits) · [Vim commands](#vim-commands) · [Mappings](#key-mappings) · [Configuration](#configuration) ·
 [Backends and cost](#review-backends-and-cost) · [Troubleshooting](#troubleshooting) · [Logs](#logs) · [Uninstall](#uninstall) · [Limitations](#limitations)
 
 ## Architecture
@@ -104,7 +104,7 @@ workspace and stops its agents.**
 
 | Trigger | When | Reviews | Default backend |
 |---|---|---|---|
-| **Idle** | 2.5 s after you stop typing (debounced; each keystroke restarts the timer) | lines changed since the last review | opencode (free hosted model) |
+| **Idle** | 1 s after you stop typing (debounced; each keystroke restarts the timer) | lines changed since the last review | opencode (free hosted model) |
 | **Save** | `:w` | everything changed in the file vs `git HEAD` (`git diff`-equivalent) + linter output | Claude Sonnet |
 | **Diff** | `:AIReviewDiff` | all uncommitted changes (`git diff HEAD`): commit-level review | Claude Sonnet |
 | **File** | `:AIReviewFile` | whole file | Claude Sonnet |
@@ -156,6 +156,23 @@ and the current review findings. Plain English works:
 Slash commands: `/explain` `/syntax` `/fix` `/review` `/test` `/security` `/perf` `/types` `/docs` `/current` `/diff`.
 To see exactly what the agent receives, run `:AIChatContext` in Vim, or `vim-ai-context` in a shell.
 
+## Live edits
+
+Watch agents change your code as it happens:
+
+* **Auto-reload.** Any file open in Vim that changes on disk reloads within about 1 s, whether the
+  change came from the chat agent, opencode, git, a formatter or another editor. Changed lines get a
+  gold `▎` marker, and the window scrolls to the first change. If you have **unsaved edits** in that
+  file, nothing is overwritten. You get a warning instead (`:e!` loads theirs, `:w` keeps yours).
+* **Agent edit feed.** When the chat agent uses Edit/Write, Claude Code hooks snapshot the file before
+  and after. The review pane prints a coloured diff, for example `✎ Claude edited src/worker.ts +2 -1`.
+* **Files you don't have open** are shown in Vim's preview window with the new lines marked. Your
+  cursor and window stay where they were. Close it with `:pclose`.
+* Marks clear when you start typing in that buffer, or with `:AIClear`. Nothing moves while you are in insert mode.
+
+Config: `show_agent_edits`, `agent_edit_follow` (scroll to changes), `agent_edit_open`
+(`preview` | `split` | `none`), `agent_edit_diff_lines`, `external_change_poll_ms`.
+
 ## Vim commands
 
 | Command | Action |
@@ -192,13 +209,14 @@ Common keys:
 
 ```json
 {
-  "idle_review_delay_ms": 2500,
+  "idle_review_delay_ms": 1000,
   "min_review_interval_s": 20,
   "auto_review": true, "review_on_idle": true, "review_on_save": true, "review_function_exit": false,
   "idle_backend": "opencode", "deep_backend": "claude", "chat_backend": "claude",
   "opencode_model": "opencode/mimo-v2.6-flash-free",
   "idle_model": "haiku", "deep_model": "sonnet",
   "show_insights": true, "show_virtual_text": true,
+  "show_agent_edits": true, "agent_edit_follow": true, "agent_edit_open": "preview",
   "right_pane_percent": 28, "review_pane_percent": 55,
   "mappings": { "next": "]a", "prev": "[a" },
   "ignore": ["*/node_modules/*", "..."],
