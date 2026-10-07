@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Restart an agent pane in the current vdev workspace: vim-ai-restart review|chat|all
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+what="${1:-all}"
+sess="${VIM_AI_SESSION:-$(tmux display-message -p '#S' 2>/dev/null || true)}"
+[ -n "$sess" ] || { echo "vim-ai-restart: run inside a vdev tmux session (or set VIM_AI_SESSION)"; exit 1; }
+for k in review chat; do
+  [ "$what" = all ] || [ "$what" = "$k" ] || continue
+  pane="$(tmux show-options -t "$sess" -v "@vimai_$k" 2>/dev/null || true)"
+  if [ -n "$pane" ] && tmux list-panes -s -t "$sess" -F '#{pane_id}' | grep -qx "$pane"; then
+    tmux respawn-pane -k -t "$pane" "$HERE/vim-ai-pane $k"
+    echo "restarted $k agent ($pane)"
+  else
+    echo "$k pane missing; recreating AI panes"; "$HERE/vdev" --panes on "$sess"; break
+  fi
+done

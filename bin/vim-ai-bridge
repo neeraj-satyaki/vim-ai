@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""vim-ai bridge: review agent + Vim IPC hub.
+
+Runs in the review pane of a vdev workspace. Listens on a private unix socket
+($VIM_AI_SESSION_DIR/bridge.sock). Vim connects with a JSON channel and sends
+review requests; the bridge runs headless `claude -p` with a JSON schema,
+validates the result, and pushes findings back. vim-ai-goto connects to the
+same socket to ask Vim to navigate.
+
+Messages (newline-delimited JSON, Vim channel framing [id, payload]):
+  Vim  -> bridge : {"type":"hello"} | {"type":"review", ...} | {"type":"cancel","file":...}
+  bridge -> Vim  : [0, {"type":"status"|"result"|"navigate", ...}]
+  goto -> bridge : {"type":"navigate","file":...,"line":N,"col":N}
+
+Model-agnostic: everything Claude-specific lives in run_model().
+"""
+import asyncio
+import difflib
+import fnmatch
+import hashlib
+import json
+import logging
+import logging.handlers
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(HERE)
+USER_CONFIG = os.path.expanduser("~/.config/vim-ai/config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "vim-ai")
+SEVERITIES = ("ERROR", "WARNING", "INSIGHT", "GOOD")
+CATEGORIES = ("CORRECTNESS", "CONCURRENCY", "RESOURCE", "DATABASE", "SECURITY",
+              "PERFORMANCE", "RELIABILITY", "TESTS", "MAINTAINABILITY")
+
+FINDINGS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                    "severity": {"type": "string", "enum": list(SEVERITIES)},
+                    "category": {"type": "string", "enum": list(CATEGORIES)},
+                    "title": {"type": "string"},
+                    "message": {"type": "string"},
+                    "suggestion": {"type": "string"},
+                },
+                "required": ["line", "severity", "category", "title", "message"],
+            },
+        }
+    },
+    "required": ["findings"],
+}
+
+C = {"r": "\033[31m", "y": "\033[33m", "c": "\033[36m", "g": "\033[32m",
+     "d": "\033[2m", "b": "\033[1m", "o": "\033[38;2;252;167;25m", "x": "\033[0m"}
+ICON = {"ERROR": C["r"] + "✖ ERROR", "WARNING": C["y"] + "⚠ WARN ", "INSIGHT": C["c"] + "ℹ INFO "}
+
+
+# ---------------------------------------------------------------- config ----
+def load_config():
+    with open(os.path.join(REPO, "config", "default.json")) as f:
+        cfg = json.load(f)
+    try:
+        with open(USER_CONFIG) as f:
+            user = json.load(f)
+        for k, v in user.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k] = {**cfg[k], **v}
+            else:
+                cfg[k] = v
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        print(f"vim-ai: ignoring bad {USER_CONFIG}: {e}", file=sys.stderr)
+    return cfg
+
+
+def setup_log():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log = logging.getLogger("vim-ai")
+    h = logging.handlers.RotatingFileHandler(os.path.join(STATE_DIR, "bridge.log"),
+                                             maxBytes=1_000_000, backupCount=2)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+    return log
+
+
+# --------------------------------------------------------- pure helpers ----
+def sha(text):
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def is_ignored(path, patterns):
+    p = "/" + path.lstrip("/")
+    return any(fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(os.path.basename(p), pat) for pat in patterns)
+
+
+def changed_ranges(old_lines, new_lines):
+    """1-based inclusive ranges in new_lines that differ from old_lines."""
+    out = []
+    sm = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if j2 > j1:
+            out.append((j1 + 1, j2))
+        elif new_lines:  # pure deletion: point at the line after the gap
+            ln = min(j1 + 1, len(new_lines))
+            out.append((ln, ln))
+    return merge_ranges(out, gap=0)
+
+
+def merge_ranges(ranges, gap):
+    out = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][1] + gap + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def meaningful(lines, ranges, min_chars):
+    text = "".join("".join(lines[a - 1:b]) for a, b in ranges)
+    return len("".join(text.split())) >= min_chars
+
+
+def numbered(lines, ranges):
+    """Render selected 1-based ranges with line numbers, '...' between gaps."""
+    parts, last = [], 0
+    for a, b in ranges:
+        if a > last + 1:
+            parts.append("     ...")
+        parts.extend(f"{i:5d}| {lines[i - 1]}" for i in range(a, b + 1))
+        last = b
+    if last < len(lines):
+        parts.append("     ...")
+    return "\n".join(parts)
+
+
+def context_ranges(n_lines, changed, cfg, cursor_line=None):
+    if n_lines <= cfg["full_file_max_lines"]:
+        return [(1, n_lines)] if n_lines else []
+    w = cfg["context_window_lines"]
+    rs = [(1, min(40, n_lines))]  # imports / module header
+    rs += [(max(1, a - w), min(n_lines, b + w)) for a, b in changed]
+    if cursor_line:
+        rs.append((max(1, cursor_line - w), min(n_lines, cursor_line + w)))
+    return merge_ranges(rs, gap=5)
+
+
+def validate_findings(raw, n_lines, cfg, default_file):
+    """Return clean findings list; never raises."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("findings"), list):
+        raise ValueError("missing findings array")
+    keep = {"ERROR", "WARNING"} | ({"INSIGHT"} if cfg["show_insights"] else set()) \
+        | ({"GOOD"} if cfg["show_good"] else set())
+    out = []
+    for f in raw["findings"]:
+        if not isinstance(f, dict):
+            continue
+        sev = str(f.get("severity", "")).upper()
+        if sev not in keep:
+            continue
+        try:
+            line = int(f.get("line"))
+        except (TypeError, ValueError):
+            continue
+        fpath = f.get("file") or default_file
+        if fpath == default_file and n_lines and not 1 <= line <= n_lines:
+            continue
+        try:
+            end = int(f.get("end_line") or line)
+        except (TypeError, ValueError):
+            end = line
+        title = str(f.get("title", "")).strip()
+        if not title:
+            continue
+        out.append({
+            "file": fpath, "line": line, "end_line": max(line, end), "severity": sev,
+            "category": str(f.get("category", "CORRECTNESS")).upper(),
+            "title": title[:160], "message": str(f.get("message", ""))[:1200],
+            "suggestion": str(f.get("suggestion", ""))[:1200],
+        })
+    order = {s: i for i, s in enumerate(SEVERITIES)}
+    out.sort(key=lambda x: (order[x["severity"]], x["file"], x["line"]))
+    return out[: cfg["max_findings"]]
+
+
+def parse_model_output(stdout):
+    """claude -p --output-format json envelope -> findings dict. Raises ValueError."""
+    env = json.loads(stdout)
+    if env.get("is_error"):
+        raise ValueError(f"model error: {str(env.get('result'))[:200]}")
+    if isinstance(env.get("structured_output"), dict):
+        return env["structured_output"]
+    res = env.get("result")
+    if isinstance(res, str):  # tolerate fenced or prefixed JSON
+        s, e = res.find("{"), res.rfind("}")
+        if s != -1 and e > s:
+            return json.loads(res[s:e + 1])
+    raise ValueError("no structured output")
+
+
+# ------------------------------------------------------------- bridge ----
+class Bridge:
+    def __init__(self, session_dir, cfg, log):
+        self.dir = session_dir
+        self.cfg = cfg
+        self.log = log
+        self.root = os.environ.get("VIM_AI_ROOT") or os.getcwd()
+        self.vims = set()
+        self.tasks = {}          # file -> asyncio.Task
+        self.snapshots = {}      # file -> lines last reviewed (idle baseline)
+        self.cache = {}          # key -> (time, findings)
+        self.last_auto = {}      # file -> time of last automatic idle review (cooldown)
+        self.deferred = {}       # file -> latest request waiting out the cooldown
+        self.sem = asyncio.Semaphore(cfg["max_concurrent_reviews"])
+        self.prompt = open(os.path.join(REPO, "prompts", "reviewer.md")).read()
+
+    # ---- output to pane
+    def say(self, text):
+        print(text, flush=True)
+
+    def rel(self, path):
+        try:
+            r = os.path.relpath(path, self.root)
+            return path if r.startswith("..") else r
+        except ValueError:
+            return path
+
+    async def push(self, payload):
+        data = (json.dumps([0, payload]) + "\n").encode()
+        for w in list(self.vims):
+            try:
+                w.write(data)
+                await w.drain()
+            except (ConnectionError, OSError):
+                self.vims.discard(w)
+
+    # ---- connection handling
+    async def handle(self, reader, writer):
+        is_vim = False
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    self.log.warning("invalid json from client")
+                    continue
+                if isinstance(msg, list) and len(msg) == 2:  # Vim channel framing
+                    msg = msg[1]
+                if not isinstance(msg, dict):
+                    continue
+                t = msg.get("type")
+                if t == "hello":
+                    is_vim = True
+                    self.vims.add(writer)
+                    self.log.info("vim connected")
+                elif t == "review":
+                    self.submit(msg)
+                elif t == "cancel":
+                    self.cancel(msg.get("file", ""), "cancel requested")
+                elif t == "navigate":
+                    ok = bool(self.vims)
+                    if ok:
+                        await self.push({k: msg.get(k) for k in ("type", "file", "line", "col")})
+                        self.say(f"{C['d']}→ jump {self.rel(str(msg.get('file')))}:{msg.get('line')}{C['x']}")
+                    writer.write((json.dumps({"ok": ok}) + "\n").encode())
+                    await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError, ValueError) as e:
+            self.log.warning("connection error: %s", e)
+        finally:
+            if is_vim:
+                self.vims.discard(writer)
+                self.log.info("vim disconnected")
+            writer.close()
+
+    def _run_deferred(self, key):
+        req = self.deferred.pop(key, None)
+        if req:
+            self.submit(req)
+
+    def cancel(self, file, why):
+        if self.deferred.pop(file, None):
+            self.log.info("deferred review dropped (%s): %s", why, self.rel(file))
+        t = self.tasks.pop(file, None)
+        if t and not t.done():
+            t.cancel()
+            self.log.info("review cancelled (%s): %s", why, self.rel(file))
+
+    def submit(self, req):
+        file = req.get("file") or ""
+        if not file and req.get("mode") != "diff":
+            return
+        key = file or "<diff>"
+        if req.get("mode") == "idle" and not req.get("manual"):
+            wait = self.cfg["min_review_interval_s"] - (time.time() - self.last_auto.get(key, 0))
+            if wait > 0:  # cooldown: keep only the newest request, run it when the window ends
+                first = key not in self.deferred
+                self.deferred[key] = req
+                if first:
+                    self.log.info("review deferred %.0fs (cooldown): %s", wait, self.rel(key))
+                    asyncio.get_running_loop().call_later(wait, self._run_deferred, key)
+                return
+            self.last_auto[key] = time.time()
+        prev = self.tasks.get(key)
+        # A newer request supersedes a running one, except idle never cancels a deeper review.
+        if prev and not prev.done():
+            if req.get("mode") == "idle" and getattr(prev, "mode", "") != "idle":
+                self.log.info("review skipped (deeper review running): %s", self.rel(key))
+                return
+            self.cancel(key, "superseded")
+        task = asyncio.ensure_future(self.review(req))
+        task.mode = req.get("mode")
+        self.tasks[key] = task
+
+    # ---- review pipeline
+    async def review(self, req):
+        mode = req.get("mode", "idle")
+        file = req.get("file", "")
+        rel = self.rel(file) if file else "<working tree>"
+        t0 = time.time()
+        try:
+            if mode == "diff":
+                prompt, lines, chash = self.build_diff_prompt()
+                if prompt is None:
+                    self.say(f"{C['d']}· no uncommitted changes{C['x']}")
+                    return
+                ranges_desc = "all uncommitted changes"
+            else:
+                if is_ignored(file, self.cfg["ignore"]):
+                    self.log.info("review skipped (ignored): %s", rel)
+                    return
+                lines = req.get("lines") or []
+                if len(lines) > self.cfg["max_file_lines"]:
+                    self.log.info("review skipped (file too large): %s", rel)
+                    return
+                chash = sha("\n".join(lines))
+                ranges = self.changed_for(mode, file, lines)
+                if mode != "file" and (not ranges or not meaningful(lines, ranges, self.cfg["min_changed_chars"])):
+                    self.log.info("review skipped (no meaningful change): %s", rel)
+                    if mode == "idle":
+                        self.snapshots[file] = lines
+                    await self.push({"type": "status", "state": "idle", "file": file})
+                    return
+                region = "\n".join("\n".join(lines[a - 1:b]) for a, b in ranges)
+                key = sha(f"{mode}|{file}|{region}|{chash}")
+                hit = self.cache.get(key)
+                if hit and time.time() - hit[0] < self.cfg["cache_ttl_s"]:
+                    self.log.info("review skipped (cached): %s", rel)
+                    await self.send_result(req, hit[1], lines, chash, cached=True)
+                    return
+                diags = await self.diagnostics(file, req.get("filetype", "")) if mode == "save" else ""
+                prompt = self.build_file_prompt(req, lines, ranges, diags)
+                ranges_desc = ", ".join(f"{a}-{b}" if a != b else str(a) for a, b in ranges[:6])
+
+            await self.push({"type": "status", "state": "reviewing", "file": file})
+            self.say(f"{C['d']}⟳ {mode:5} {rel}  [{ranges_desc}]{C['x']}")
+            self.log.info("review started mode=%s file=%s", mode, rel)
+            async with self.sem:
+                raw = await self.run_backend(prompt, mode)
+            findings = validate_findings(raw, len(lines), self.cfg, file)
+            if mode == "idle":
+                self.snapshots[file] = lines
+            if mode != "diff":
+                self.cache[key] = (time.time(), findings)
+            self.log.info("review completed mode=%s file=%s findings=%d %.1fs",
+                          mode, rel, len(findings), time.time() - t0)
+            await self.send_result(req, findings, lines, chash)
+            self.render(rel, mode, findings, time.time() - t0)
+        except asyncio.CancelledError:
+            self.say(f"{C['d']}✗ cancelled {rel}{C['x']}")
+            raise
+        except ValueError as e:
+            self.log.warning("invalid model response for %s: %s", rel, e)
+            self.say(f"{C['r']}! invalid response for {rel} (logged){C['x']}")
+            await self.push({"type": "status", "state": "error", "file": file})
+        except Exception as e:  # never die on one review
+            self.log.exception("review failed for %s", rel)
+            self.say(f"{C['r']}! review failed for {rel}: {e}{C['x']}")
+            await self.push({"type": "status", "state": "error", "file": file})
+        finally:
+            if self.tasks.get(file or "<diff>") is asyncio.current_task():
+                self.tasks.pop(file or "<diff>", None)
+
+    def changed_for(self, mode, file, lines):
+        if mode == "file":
+            return [(1, len(lines))] if lines else []
+        if mode == "idle":
+            base = self.snapshots.get(file)
+            if base is None:
+                base = self.read_disk(file)
+                if base is None or base == lines:  # new file or nothing unsaved: diff vs HEAD
+                    base = self.git_head(file)
+        else:  # save: everything changed vs HEAD (git diff), else vs last save
+            base = self.git_head(file)
+            if base is None:
+                base = self.snapshots.get(file, [])
+        if base is None:
+            base = []
+        ranges = changed_ranges(base, lines)
+        total, out = 0, []
+        for a, b in ranges:  # cap review size
+            if total >= self.cfg["max_changed_lines"]:
+                break
+            out.append((a, min(b, a + self.cfg["max_changed_lines"] - total - 1)))
+            total += out[-1][1] - a + 1
+        return out
+
+    @staticmethod
+    def read_disk(file):
+        try:
+            with open(file, encoding="utf-8", errors="replace") as f:
+                return f.read().splitlines()
+        except OSError:
+            return None
+
+    def git_head(self, file):
+        try:
+            d = os.path.dirname(file) or "."
+            top = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True, timeout=5)
+            if top.returncode:
+                return None
+            relp = os.path.relpath(os.path.realpath(file), os.path.realpath(top.stdout.strip()))
+            r = subprocess.run(["git", "-C", top.stdout.strip(), "show", f"HEAD:{relp}"],
+                               capture_output=True, text=True, timeout=5, errors="replace")
+            return r.stdout.splitlines() if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def project_rules(self):
+        for name in (".ai-review.md", ".claude/review-rules.md"):
+            p = os.path.join(self.root, name)
+            if os.path.isfile(p):
+                with open(p, errors="replace") as f:
+                    return f.read()[:8000]
+        return ""
+
+    async def diagnostics(self, file, ft):
+        out = []
+        for cmd in self.cfg["linters"].get(ft, []):
+            if not shutil.which(cmd[0]):
+                continue
+            argv = [a.replace("{file}", file) for a in cmd]
+            try:
+                p = await asyncio.create_subprocess_exec(*argv, cwd=self.root, stdout=asyncio.subprocess.PIPE,
+                                                         stderr=asyncio.subprocess.STDOUT)
+                so, _ = await asyncio.wait_for(p.communicate(), 20)
+                text = so.decode(errors="replace").strip()
+                if text and "No configuration file" not in text and "couldn't find a configuration" not in text:
+                    out.append(f"$ {' '.join(cmd[:1])}\n{text[:3000]}")
+            except (asyncio.TimeoutError, OSError):
+                pass
+            break  # first available linter only
+        return "\n".join(out)
+
+    def build_file_prompt(self, req, lines, ranges, diags):
+        rel = self.rel(req["file"])
+        cur = req.get("cursor") or [0, 0]
+        ctx = context_ranges(len(lines), ranges, self.cfg, cur[0])
+        mode_desc = {
+            "idle": "IDLE review: lightweight; only the changed lines just typed. Report only clear, important issues.",
+            "save": "SAVE review: deeper review of all changes in this file versus git HEAD.",
+            "file": "FILE review: review the whole file.",
+        }[req.get("mode", "idle")]
+        parts = [
+            mode_desc,
+            f"Project root: {self.root}",
+            f"File: {rel}   Language: {req.get('filetype') or 'unknown'}   Cursor: line {cur[0]}",
+            "Changed line ranges (review these): " + ", ".join(f"{a}-{b}" for a, b in ranges),
+            "The buffer below is the CURRENT unsaved editor content and is authoritative "
+            "(the file on disk may be older). Line numbers are exact.",
+            "```\n" + numbered(lines, ctx) + "\n```",
+        ]
+        if diags:
+            parts.append("Existing linter/compiler diagnostics (do not repeat them; add insight only):\n" + diags)
+        rules = self.project_rules()
+        if rules:
+            parts.append("Project review rules:\n" + rules)
+        return "\n\n".join(parts)
+
+    def build_diff_prompt(self):
+        try:
+            r = subprocess.run(["git", "-C", self.root, "diff", "HEAD", "--unified=3", "--no-color"],
+                               capture_output=True, text=True, timeout=20, errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            return None, [], ""
+        if r.returncode or not r.stdout.strip():
+            return None, [], ""
+        # drop ignored files from the diff
+        chunks, keep = r.stdout.split("\ndiff --git "), []
+        for i, ch in enumerate(chunks):
+            head = ch.split("\n", 1)[0]
+            path = head.split(" b/")[-1] if " b/" in head else head
+            if not is_ignored(path, self.cfg["ignore"]):
+                keep.append(ch if i == 0 else "diff --git " + ch)
+        diff = "\n".join(keep)[:60000]
+        if not diff.strip():
+            return None, [], ""
+        prompt = ("DIFF review: review ALL uncommitted changes below (commit-level). Use the file "
+                  "field on every finding (path relative to project root) and new-file line numbers.\n\n"
+                  f"Project root: {self.root}\n\n```diff\n{diff}\n```")
+        rules = self.project_rules()
+        if rules:
+            prompt += "\n\nProject review rules:\n" + rules
+        return prompt, [], sha(diff)
+
+    async def run_backend(self, prompt, mode):
+        """Pick the backend for this review mode (config: idle_backend / deep_backend)."""
+        backend = self.cfg["idle_backend"] if mode == "idle" else self.cfg["deep_backend"]
+        model = self.cfg["idle_model"] if mode == "idle" else self.cfg["deep_model"]
+        if backend == "opencode":
+            return await self.run_opencode(prompt)
+        if backend == "ollama":
+            try:
+                return await asyncio.to_thread(self.run_ollama, prompt)
+            except OSError as e:  # server down / model missing
+                if not self.cfg["ollama_fallback_to_claude"]:
+                    raise ValueError(f"ollama unavailable: {e}")
+                self.log.warning("ollama unavailable (%s); falling back to claude", e)
+        return await self.run_claude(prompt, model)
+
+    def run_ollama(self, prompt):
+        """Local model via Ollama structured outputs. No tools: context comes from the prompt."""
+        body = {
+            "model": self.cfg["ollama_model"], "stream": False, "format": FINDINGS_SCHEMA,
+            "keep_alive": self.cfg["ollama_keep_alive"],
+            "options": {"temperature": 0, "num_ctx": self.cfg["ollama_num_ctx"], "num_predict": 1200},
+            "messages": [{"role": "system", "content": self.prompt},
+                         {"role": "user", "content": prompt + "\n\nRespond with JSON only."}],
+        }
+        req = urllib.request.Request(self.cfg["ollama_url"].rstrip("/") + "/api/chat",
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.cfg["review_timeout_s"]) as r:
+                env = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            raise OSError(f"HTTP {e.code}: {e.read()[:200]!r}")
+        content = (env.get("message") or {}).get("content", "")
+        try:
+            return json.loads(content)
+        except ValueError:
+            s, e = content.find("{"), content.rfind("}")
+            if s != -1 and e > s:
+                return json.loads(content[s:e + 1])
+            raise ValueError("ollama returned non-JSON")
+
+    async def run_opencode(self, prompt):
+        """opencode CLI (any provider/model it supports, incl. free hosted models; no GPU).
+        Runs the read-only 'plan' agent; JSON shape is enforced by the prompt + validator."""
+        exe = shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+        msg = (self.prompt + "\n\n---\n\n" + prompt + "\n\nRespond with ONLY a JSON object (no prose, no code fence) "
+               "matching this JSON Schema:\n" + json.dumps(FINDINGS_SCHEMA))
+        argv = [exe, "run", "--pure", "--agent", self.cfg["opencode_agent"], "--format", "json",
+                "-m", self.cfg["opencode_model"], msg]
+        p = await asyncio.create_subprocess_exec(*argv, cwd=self.root, stdin=asyncio.subprocess.DEVNULL,
+                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                                                 start_new_session=True)
+        try:
+            so, se = await asyncio.wait_for(p.communicate(), self.cfg["review_timeout_s"])
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            try:
+                os.killpg(p.pid, 15)
+            except ProcessLookupError:
+                pass
+            raise
+        text = []
+        for line in so.decode(errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "text":
+                text.append((ev.get("part") or {}).get("text", ""))
+            elif ev.get("type") == "error":
+                raise ValueError(f"opencode error: {str(ev)[:200]}")
+        content = "".join(text)
+        st, en = content.find("{"), content.rfind("}")
+        if st == -1 or en <= st:
+            raise ValueError(f"opencode returned no JSON (exit {p.returncode}): {se.decode(errors='replace')[:200]}")
+        return json.loads(content[st:en + 1])
+
+    async def run_claude(self, prompt, model):
+        """Headless Claude Code. Returns parsed findings dict."""
+        argv = ["claude", "-p", "--output-format", "json",
+                "--json-schema", json.dumps(FINDINGS_SCHEMA),
+                "--append-system-prompt", self.prompt,
+                "--tools", self.cfg["reviewer_tools"],
+                "--setting-sources", "project", "--strict-mcp-config",
+                "--no-session-persistence",
+                "--settings", json.dumps({"permissions": {"deny": [
+                    "Read(**/.env)", "Read(**/.env.*)", "Read(**/*.pem)", "Read(**/*.key)",
+                    "Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gh/**)"]}})]
+        if model:
+            argv += ["--model", model]
+        p = await asyncio.create_subprocess_exec(
+            *argv, cwd=self.root, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
+        try:
+            so, se = await asyncio.wait_for(p.communicate(prompt.encode()), self.cfg["review_timeout_s"])
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            try:
+                os.killpg(p.pid, 15)
+            except ProcessLookupError:
+                pass
+            raise
+        if p.returncode and not so:
+            raise ValueError(f"claude exited {p.returncode}: {se.decode(errors='replace')[:200]}")
+        return parse_model_output(so.decode(errors="replace"))
+
+    async def send_result(self, req, findings, lines, chash, cached=False):
+        out = []
+        for f in findings:
+            f = dict(f)
+            if f["file"] == req.get("file") and lines and 1 <= f["line"] <= len(lines):
+                f["line_text"] = lines[f["line"] - 1]  # anchor for stale-result remapping
+            elif f["file"] and not os.path.isabs(f["file"]):
+                f["file"] = os.path.join(self.root, f["file"])
+            out.append(f)
+        await self.push({
+            "type": "result", "review_id": uuid.uuid4().hex[:12], "mode": req.get("mode"),
+            "file": req.get("file", ""), "tick": req.get("tick"), "content_hash": chash,
+            "reviewed_at": time.time(), "cached": cached, "findings": out,
+        })
+
+    def render(self, rel, mode, findings, secs):
+        if not findings:
+            self.say(f"{C['d']}  {rel}: nothing to report ({secs:.0f}s){C['x']}")
+            return
+        self.say(f"{C['b']}{rel}{C['x']} {C['d']}({mode}, {secs:.0f}s){C['x']}")
+        for f in findings:
+            loc = f"{self.rel(f['file'])}:{f['line']}" if f["file"] and self.rel(f["file"]) != rel else f"line {f['line']}"
+            self.say(f" {ICON.get(f['severity'], f['severity'])}{C['x']} {loc} {C['b']}{f['title']}{C['x']}")
+            if f["message"]:
+                self.say(f"   {f['message']}")
+            if f["suggestion"]:
+                self.say(f"   {C['g']}→ {f['suggestion']}{C['x']}")
+        self.say("")
+
+
+async def serve(session_dir):
+    cfg = load_config()
+    log = setup_log()
+    os.makedirs(session_dir, mode=0o700, exist_ok=True)
+    sock = os.path.join(session_dir, "bridge.sock")
+    try:
+        os.unlink(sock)
+    except FileNotFoundError:
+        pass
+    b = Bridge(session_dir, cfg, log)
+    server = await asyncio.start_unix_server(b.handle, path=sock, limit=32 * 1024 * 1024)
+    os.chmod(sock, 0o600)
+    log.info("bridge listening %s", sock)
+    print(f"{C['o']}{C['b']}◆ Satyaki vim-ai{C['x']}  {C['b']}Auto Review Agent{C['x']}")
+    def label(backend, claude_model):
+        return {"ollama": f"ollama {cfg['ollama_model']}", "opencode": cfg["opencode_model"]}.get(
+            backend, f"claude {claude_model}")
+    idle, deep = label(cfg["idle_backend"], cfg["idle_model"]), label(cfg["deep_backend"], cfg["deep_model"])
+    print(f"{C['d']}{b.root}\nidle ({cfg['idle_review_delay_ms']}ms, min {cfg['min_review_interval_s']}s apart): {idle}"
+          f"  ·  :w / diff: {deep}\nquiet when nothing to report  ·  :AIReviewPause to pause{C['x']}\n", flush=True)
+    async with server:
+        await server.serve_forever()
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--print-config"]:
+        print(json.dumps(load_config()))
+        return
+    if args[:1] == ["--schema"]:
+        print(json.dumps(FINDINGS_SCHEMA))
+        return
+    session_dir = os.environ.get("VIM_AI_SESSION_DIR") or (args[0] if args else None)
+    if not session_dir:
+        sys.exit("usage: vim-ai-bridge <session-dir>  (or set VIM_AI_SESSION_DIR)")
+    try:
+        asyncio.run(serve(session_dir))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+{
+  "name": "vim-ai",
+  "version": "0.1.0",
+  "description": "Vim-context chat commands for the vdev workspace (Satyaki Solutions)",
+  "author": { "name": "Satyaki Solutions Pvt Ltd" }
+}

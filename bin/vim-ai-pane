@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Supervisor for a workspace pane: vim-ai-pane review|chat
+# Restarts a crashed agent, but stops auto-restarting after 3 failures in 2 min
+# and waits for Enter instead (no infinite crash loops).
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+kind="${1:?usage: vim-ai-pane review|chat}"
+case "$kind" in
+  review) cmd=("$HERE/vim-ai-bridge" "$VIM_AI_SESSION_DIR"); printf '\033]2;AI review\033\\' ;;
+  chat)   cmd=("$HERE/vim-ai-chat"); printf '\033]2;AI chat\033\\' ;;
+  *) echo "unknown pane: $kind"; exit 2 ;;
+esac
+fails=()
+while true; do
+  "${cmd[@]}"; rc=$?
+  now=$(date +%s)
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ]; then
+    printf '\n\033[2m%s agent exited. Press Enter to restart it.\033[0m ' "$kind"; read -r _ || exit 0
+    fails=(); continue
+  fi
+  fails+=("$now"); recent=()
+  for t in "${fails[@]}"; do [ $((now - t)) -lt 120 ] && recent+=("$t"); done
+  fails=("${recent[@]}")
+  echo "vim-ai: $kind agent exited with code $rc ($(date +%T))" >>"${XDG_STATE_HOME:-$HOME/.local/state}/vim-ai/bridge.log"
+  if [ "${#fails[@]}" -ge 3 ]; then
+    printf '\n\033[31m%s agent failed 3 times in 2 min (last code %s). Check: vim-ai-doctor\033[0m\nPress Enter to retry. ' "$kind" "$rc"
+    read -r _ || exit 1; fails=()
+  else
+    printf '\n\033[33m%s agent exited (code %s); restarting in 2s...\033[0m\n' "$kind" "$rc"; sleep 2
+  fi
+done

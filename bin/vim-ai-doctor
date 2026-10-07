@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# vim-ai-doctor — health check for the vdev / vim-ai workspace.
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO="$(dirname "$HERE")"
+ok=0; bad=0; warn=0
+g=$'\033[32m'; r=$'\033[31m'; y=$'\033[33m'; d=$'\033[2m'; x=$'\033[0m'
+pass() { printf '  %-22s %s✓%s %s\n' "$1" "$g" "$x" "$d${2:-}$x"; ok=$((ok+1)); }
+fail() { printf '  %-22s %s✗%s %s\n' "$1" "$r" "$x" "${2:-}"; bad=$((bad+1)); }
+soft() { printf '  %-22s %s!%s %s\n' "$1" "$y" "$x" "${2:-}"; warn=$((warn+1)); }
+
+printf '\033[38;2;252;167;25m\033[1m◆ Satyaki vim-ai doctor\033[0m\n\n'
+
+if command -v vim >/dev/null; then
+  feats="$(vim --version)"; missing=""
+  for f in channel job timers textprop popupwin signs quickfix; do grep -q "+$f" <<<"$feats" || missing+=" $f"; done
+  v="$(vim --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  [ -z "$missing" ] && pass Vim "$v" || fail Vim "missing features:$missing"
+else fail Vim "not installed"; fi
+command -v tmux >/dev/null && pass tmux "$(tmux -V)" || fail tmux "install: sudo apt install tmux"
+if command -v claude >/dev/null; then pass "Claude Code" "$(claude --version 2>/dev/null | head -1)"
+else fail "Claude Code" "not on PATH (chat + deep reviews need it)"; fi
+command -v git >/dev/null && pass Git "$(git --version | cut -d' ' -f3)" || fail Git "not installed"
+command -v python3 >/dev/null && pass Python "$(python3 -V 2>&1 | cut -d' ' -f2)" || fail Python "python3 required"
+command -v jq >/dev/null && pass jq "" || soft jq "optional (JSON linting)"
+
+cfg="$("$HERE/vim-ai-bridge" --print-config 2>/dev/null)"
+if [ -n "$cfg" ]; then pass Config "${HOME}/.config/vim-ai/config.json"; else fail Config "invalid JSON in ~/.config/vim-ai/config.json"; fi
+uses_oc="$(python3 -c 'import json,sys;c=json.loads(sys.argv[1]);print(int("opencode" in (c["idle_backend"],c["deep_backend"],c.get("chat_backend",""))))' "$cfg" 2>/dev/null)"
+if [ "$uses_oc" = 1 ]; then
+  oc="$(command -v opencode || echo "$HOME/.opencode/bin/opencode")"
+  [ -x "$oc" ] && pass opencode "$("$oc" --version 2>/dev/null)" || fail opencode "install: curl -fsSL https://opencode.ai/install | bash"
+fi
+uses_ollama="$(python3 -c 'import json,sys;c=json.loads(sys.argv[1]);print(int("ollama" in (c["idle_backend"],c["deep_backend"])))' "$cfg" 2>/dev/null)"
+if [ "$uses_ollama" = 1 ]; then
+  url="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["ollama_url"])' "$cfg")"
+  model="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["ollama_model"])' "$cfg")"
+  if curl -s -m 2 "$url/api/tags" | grep -q "\"$model\""; then pass "Ollama model" "$model"
+  elif curl -s -m 2 "$url/api/version" >/dev/null; then fail "Ollama model" "run: ollama pull $model"
+  else fail "Ollama" "not running at $url (sudo systemctl start ollama) or set idle_backend=claude"; fi
+fi
+
+python3 "$REPO/tests/test_bridge.py" >/dev/null 2>&1 && pass "Reviewer bridge" "self-test passed" || fail "Reviewer bridge" "python3 $REPO/tests/test_bridge.py"
+for b in vdev vim-ai-bridge vim-ai-chat vim-ai-context vim-ai-goto vim-ai-pane vim-ai-restart; do
+  [ -x "$HERE/$b" ] || { fail Permissions "$HERE/$b not executable"; continue 2; }
+done; pass Permissions "scripts executable"
+command -v vdev >/dev/null && pass "Launcher" "$(command -v vdev)" || soft "Launcher" "vdev not on PATH (run install.sh or add ~/.local/bin)"
+
+pl="$HOME/.vim/plugin/vim_ai.vim"; al="$HOME/.vim/autoload/vimai.vim"
+if [ -e "$pl" ] && [ -e "$al" ]; then
+  out="$(VIM_AI_ENABLED=0 vim -Nes -c 'redir! > /dev/stdout | AIReview | redir END' -c 'qa!' 2>&1)"
+  grep -q 'disabled' <<<"$out" && pass "Vim integration" "loaded; no-op outside AI mode" || fail "Vim integration" "plugin did not load: $out"
+else fail "Vim integration" "missing $pl or $al (run install.sh)"; fi
+
+if [ -n "${VIM_AI_SESSION_DIR:-}" ]; then
+  [ -S "$VIM_AI_SESSION_DIR/bridge.sock" ] && pass "Bridge socket" "$VIM_AI_SESSION_DIR" || fail "Bridge socket" "review agent not running: vim-ai-restart review"
+  [ -f "$VIM_AI_SESSION_DIR/context.json" ] && pass "Chat context" "updated $(( $(date +%s) - $(stat -c %Y "$VIM_AI_SESSION_DIR/context.json") ))s ago" || soft "Chat context" "not written yet (move the cursor in Vim)"
+  if [ -n "${VIM_AI_SESSION:-}" ]; then
+    n="$(tmux list-panes -s -t "$VIM_AI_SESSION" 2>/dev/null | wc -l)"
+    [ "$n" -ge 3 ] && pass "Workspace layout" "$n panes" || soft "Workspace layout" "$n pane(s) — vim-ai-restart all"
+  fi
+else
+  printf '  %-22s %s\n' "Workspace" "${d}not inside vdev (session checks skipped)${x}"
+fi
+printf '\n'
+if [ "$bad" -eq 0 ]; then printf '%sSystem ready.%s' "$g" "$x"; [ "$warn" -gt 0 ] && printf ' (%d warning(s))' "$warn"; printf '\n'
+else printf '%s%d problem(s) found.%s Logs: %s\n' "$r" "$bad" "$x" "${XDG_STATE_HOME:-$HOME/.local/state}/vim-ai/"; exit 1; fi

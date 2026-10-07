@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Interactive Claude Code chat agent for a vdev workspace.
+# Separate session from the reviewer. Vim context is attached to every prompt
+# by a UserPromptSubmit hook (vim-ai-context); /explain, /perf, ... come from
+# the bundled plugin; vim-ai-goto lets it jump Vim to a location.
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO="$(dirname "$HERE")"
+: "${VIM_AI_SESSION_DIR:?not in a vdev workspace}"
+export PATH="$HERE:$PATH"
+
+settings="$VIM_AI_SESSION_DIR/chat-settings.json"
+cat >"$settings" <<EOF
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "$HERE/vim-ai-context --hook", "timeout": 5 } ] }
+    ]
+  },
+  "permissions": {
+    "allow": ["Bash(vim-ai-goto:*)", "Bash($HERE/vim-ai-goto:*)", "Bash(vim-ai-context)"],
+    "deny": ["Read(**/.env)", "Read(**/.env.*)", "Read(**/*.pem)", "Read(**/*.key)", "Read(~/.ssh/**)"]
+  }
+}
+EOF
+
+cfg() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$VIM_AI_SESSION_DIR/config.json" "$1" 2>/dev/null || true; }
+
+if [ "$(cfg chat_backend)" = opencode ]; then
+  # opencode has no per-prompt hook, so it is told to fetch the Vim context itself.
+  oc="$(command -v opencode || echo "$HOME/.opencode/bin/opencode")"
+  cat >"$VIM_AI_SESSION_DIR/opencode-chat.md" <<'EOF2'
+Before answering anything about the user's code ("this", "here", "this line/function"),
+run the bash command `vim-ai-context` to get the live Vim editor state (file, cursor,
+enclosing function, selection, nearby code) and answer from it.
+EOF2
+  cat >"$VIM_AI_SESSION_DIR/opencode.json" <<EOF2
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "instructions": ["$REPO/prompts/chat.md", "$VIM_AI_SESSION_DIR/opencode-chat.md"],
+  "permission": { "bash": { "vim-ai-context": "allow", "vim-ai-goto *": "allow" } }
+}
+EOF2
+  export OPENCODE_CONFIG="$VIM_AI_SESSION_DIR/opencode.json"
+  exec "$oc" -m "$(cfg opencode_chat_model)" "${VIM_AI_ROOT:-$PWD}"
+fi
+
+model="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("chat_model",""))' "$VIM_AI_SESSION_DIR/config.json" 2>/dev/null || true)"
+args=(--name "vim-ai chat · $(basename "${VIM_AI_ROOT:-$PWD}")"
+      --append-system-prompt-file "$REPO/prompts/chat.md"
+      --settings "$settings"
+      --plugin-dir "$REPO/claude-plugin")
+[ -n "$model" ] && args+=(--model "$model")
+exec claude "${args[@]}"

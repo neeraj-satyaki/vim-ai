@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Ask the Vim in this vdev workspace to jump to a location.
+
+usage: vim-ai-goto FILE[:LINE[:COL]]   |   vim-ai-goto FILE LINE [COL]
+
+Sends a structured {"type":"navigate"} message over the bridge socket; the
+trusted Vim-side handler validates it and runs :edit + cursor(). No keystroke
+injection.
+"""
+import json
+import os
+import re
+import socket
+import sys
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    m = re.match(r"^(.*?)(?::(\d+))?(?::(\d+))?$", args[0])
+    file, line, col = m.group(1), int(m.group(2) or 1), int(m.group(3) or 1)
+    if len(args) > 1:
+        line = int(args[1])
+    if len(args) > 2:
+        col = int(args[2])
+    root = os.environ.get("VIM_AI_ROOT") or os.getcwd()
+    path = file if os.path.isabs(file) else os.path.normpath(os.path.join(os.getcwd(), file))
+    if not os.path.exists(path) and not os.path.isabs(file):
+        path = os.path.normpath(os.path.join(root, file))
+    if not os.path.isfile(path):
+        print(f"vim-ai-goto: no such file: {file}", file=sys.stderr)
+        return 1
+    sd = os.environ.get("VIM_AI_SESSION_DIR")
+    if not sd:
+        print("vim-ai-goto: not inside a vdev AI workspace (VIM_AI_SESSION_DIR unset)", file=sys.stderr)
+        return 1
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(3)
+        s.connect(os.path.join(sd, "bridge.sock"))
+        s.sendall((json.dumps({"type": "navigate", "file": path, "line": line, "col": col}) + "\n").encode())
+        reply = json.loads(s.makefile().readline() or "{}")
+    except (OSError, ValueError) as e:
+        print(f"vim-ai-goto: bridge unavailable ({e}); restart with: vim-ai-restart review", file=sys.stderr)
+        return 1
+    if not reply.get("ok"):
+        print("vim-ai-goto: Vim is not connected to the bridge", file=sys.stderr)
+        return 1
+    print(f"Vim jumped to {os.path.relpath(path, root)}:{line}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

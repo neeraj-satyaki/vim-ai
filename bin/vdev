@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# vdev — Vim-first development workspace with optional Claude agents.
+# Satyaki Solutions · vim-ai
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+VERSION="0.1.0"
+banner() {
+  printf '\033[38;2;252;167;25m\033[1m'
+  cat <<'BANNER'
+   ____        _               _    _
+  / ___|  __ _| |_ _   _  __ _| | _(_)
+  \___ \ / _` | __| | | |/ _` | |/ / |
+   ___) | (_| | |_| |_| | (_| |   <| |
+  |____/ \__,_|\__|\__, |\__,_|_|\_\_|
+                   |___/   vim-ai
+BANNER
+  printf '\033[0m  Creating Innovative Impulse · Satyaki Solutions Pvt Ltd · https://satyaki.co.in\n'
+}
+
+usage() {
+  cat <<'EOF'
+vdev — Vim-first workspace with Claude review + chat agents (Satyaki Solutions)
+
+Usage:
+  vdev [options] [project|file]
+
+Options:
+  --noai        Launch Vim without Claude review/chat agents (plain Vim, no tmux)
+  --ai          Explicitly enable AI mode (default)
+  -V, --version Show version
+  -h, --help    Show help
+
+Examples:
+  vdev .
+  vdev ~/projects/api
+  vdev src/worker.ts          # opens the file, project root detected
+  vdev --noai .
+  vdev ~/projects/api --noai
+
+Inside the workspace:  vim-ai-restart review|chat   vim-ai-doctor
+EOF
+}
+
+cfg_get() { # key default — read from merged config
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || echo "$2"
+import json,subprocess,sys,os
+here=os.environ["VIM_AI_HERE"]
+c=json.loads(subprocess.run([here+"/vim-ai-bridge","--print-config"],capture_output=True,text=True).stdout)
+print(c.get(sys.argv[1],sys.argv[2]))
+PY
+}
+export VIM_AI_HERE="$HERE"
+
+find_root() { # dir -> project root
+  local d="$1"
+  while [ "$d" != "/" ]; do
+    for m in .git package.json pyproject.toml Cargo.toml go.mod; do
+      [ -e "$d/$m" ] && { echo "$d"; return; }
+    done
+    d="$(dirname "$d")"
+  done
+  echo "$1"
+}
+
+session_name() { # root -> stable unique tmux session name
+  local base; base="$(basename "$1" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-24)"
+  echo "vdev-${base%_}-$(printf '%s' "$1" | sha1sum | cut -c1-6)"
+}
+
+session_dir() {
+  local base="${XDG_RUNTIME_DIR:-/tmp/vim-ai-$(id -u)}"
+  echo "$base/vim-ai/$1"
+}
+
+panes_on() { # session
+  local s="$1" root sd vimpane rp cp rw rv
+  root="$(tmux show-options -t "$s" -v @vimai_root)"
+  sd="$(tmux show-options -t "$s" -v @vimai_dir)"
+  vimpane="$(tmux show-options -t "$s" -v @vimai_vim)"
+  rw="$(cfg_get right_pane_percent 28)"; rv="$(cfg_get review_pane_percent 55)"
+  local envs=(-e "VIM_AI_ENABLED=1" -e "VIM_AI_SESSION=$s" -e "VIM_AI_SESSION_DIR=$sd" -e "VIM_AI_ROOT=$root" -e "PATH=$HERE:$PATH")
+  rp="$(tmux split-window -d -h -l "${rw}%" -t "$vimpane" -c "$root" -P -F '#{pane_id}' "${envs[@]}" "$HERE/vim-ai-pane review")"
+  cp="$(tmux split-window -d -v -l "$((100 - rv))%" -t "$rp" -c "$root" -P -F '#{pane_id}' "${envs[@]}" "$HERE/vim-ai-pane chat")"
+  tmux set-option -t "$s" @vimai_review "$rp" \; set-option -t "$s" @vimai_chat "$cp"
+  tmux select-pane -t "$rp" -T "AI review" \; select-pane -t "$cp" -T "AI chat" \; select-pane -t "$vimpane"
+}
+
+panes_off() { # session
+  local s="$1" p
+  for k in review chat; do
+    p="$(tmux show-options -t "$s" -v "@vimai_$k" 2>/dev/null || true)"
+    [ -n "$p" ] && tmux kill-pane -t "$p" 2>/dev/null || true
+    tmux set-option -t "$s" -u "@vimai_$k" 2>/dev/null || true
+  done
+}
+
+# ---- internal subcommands (used by Vim / restart / cleanup) ----
+case "${1:-}" in
+  --panes)
+    case "${2:-}" in on) panes_on "$3" ;; off) panes_off "$3" ;; *) exit 2 ;; esac; exit 0 ;;
+  --cleanup)  # called when Vim exits: tear down agents + state
+    s="$2"; sd="$(session_dir "$s")"
+    case "$sd" in */vim-ai/vdev-*) rm -rf -- "$sd" ;; esac
+    tmux kill-session -t "$s" 2>/dev/null || true; exit 0 ;;
+esac
+
+# ---- argument parsing ----
+ai=1; target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --noai|--no-ai) ai=0 ;;
+    --ai) ai=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) banner; echo "  vdev $VERSION"; exit 0 ;;
+    --) shift; target="${1:-}"; break ;;
+    -*) echo "vdev: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *) [ -n "$target" ] && { echo "vdev: only one project/file allowed" >&2; exit 2; }; target="$1" ;;
+  esac
+  shift
+done
+target="${target:-.}"
+[ -e "$target" ] || { echo "vdev: no such file or directory: $target" >&2; exit 1; }
+target="$(readlink -f "$target")"
+if [ -d "$target" ]; then root="$(find_root "$target")"; open="."; [ "$target" != "$root" ] && open="$target"
+else root="$(find_root "$(dirname "$target")")"; open="$target"; fi
+
+if [ "$ai" = 1 ]; then
+  for dep in tmux claude python3; do
+    command -v "$dep" >/dev/null || { echo "vdev: '$dep' not found — starting without AI (see vim-ai-doctor)" >&2; ai=0; break; }
+  done
+fi
+
+# ---- no-AI mode: plain Vim, zero agent processes ----
+if [ "$ai" = 0 ]; then
+  cd "$root"
+  unset VIM_AI_HERE; VIM_AI_ENABLED=0 exec vim "$open"
+fi
+
+# ---- AI mode ----
+s="$(session_name "$root")"
+if tmux has-session -t "=$s" 2>/dev/null; then
+  if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$s"; else exec tmux attach -t "=$s"; fi
+fi
+sd="$(session_dir "$s")"
+mkdir -p -m 700 "$(dirname "$sd")" "$sd"
+"$HERE/vim-ai-bridge" --print-config >"$sd/config.json"
+mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/vim-ai"
+
+cols="$(tput cols 2>/dev/null || echo 200)"; rows="$(tput lines 2>/dev/null || echo 50)"
+q() { printf '%q' "$1"; }
+vimcmd="cd $(q "$root") && vim $(q "$open"); $(q "$HERE/vdev") --cleanup $(q "$s")"
+vp="$(tmux new-session -d -s "$s" -x "$cols" -y "$rows" -c "$root" -P -F '#{pane_id}' \
+  -e VIM_AI_ENABLED=1 -e "VIM_AI_SESSION=$s" -e "VIM_AI_SESSION_DIR=$sd" -e "VIM_AI_ROOT=$root" \
+  -e "PATH=$HERE:$PATH" "$vimcmd")"
+tmux set-option -t "$s" @vimai_root "$root" \; set-option -t "$s" @vimai_dir "$sd" \; set-option -t "$s" @vimai_vim "$vp"
+# session-scoped UI only; never touches ~/.tmux.conf
+tmux set-option -t "$s" mouse on \; set-option -t "$s" pane-border-status top \
+  \; set-option -t "$s" pane-border-format ' #{?#{==:#{pane_title},AI review},◆ AI review,#{?#{==:#{pane_title},AI chat},◆ AI chat,vim}} ' \
+  \; set-option -t "$s" status-right "#[fg=#FCA719,bold]◆ Satyaki vim-ai #[default]#{session_name} " \
+  \; set-option -t "$s" status-right-length 60
+tmux select-pane -t "$vp" -T vim
+panes_on "$s"
+
+if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$s"; else exec tmux attach -t "=$s"; fi

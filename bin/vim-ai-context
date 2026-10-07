@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Print the current Vim editor context for the chat agent.
+
+Used as a Claude Code UserPromptSubmit hook (--hook): its stdout is attached
+to every chat prompt, so "explain this" knows what is under the cursor.
+Run without args to see what the chat agent currently receives.
+"""
+import json
+import os
+import sys
+import time
+
+
+def main():
+    hook = "--hook" in sys.argv
+    if hook:
+        try:
+            json.load(sys.stdin)  # hook payload; prompt not needed
+        except ValueError:
+            pass
+    sd = os.environ.get("VIM_AI_SESSION_DIR")
+    path = os.path.join(sd, "context.json") if sd else ""
+    try:
+        with open(path) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        if not hook:
+            print("no Vim context yet (is Vim running inside vdev?)")
+        return 0
+    age = int(time.time() - c.get("updated", 0))
+    cur = c.get("cursor", {})
+    out = [
+        "<vim-context source=\"vim-ai\" note=\"Live state of the user's Vim editor. "
+        "'this'/'here'/'this line'/'this function' refer to it.\">",
+        f"project: {c.get('project')}  git_branch: {c.get('git_branch') or '-'}",
+        f"file: {c.get('file') or '[no file]'}  filetype: {c.get('filetype') or '-'}  "
+        f"modified: {c.get('modified')}  (updated {age}s ago)",
+        f"cursor: line {cur.get('line')}, col {cur.get('column')}",
+    ]
+    if c.get("function"):
+        out.append(f"enclosing function (heuristic): line {c['function'].get('line')}: {c['function'].get('text')}")
+    out.append(f"current line: {c.get('current_line', '')}")
+    sel = c.get("selection")
+    if sel:
+        out.append(f"visual selection (lines {sel.get('start')}-{sel.get('end')}):\n```\n{sel.get('text', '')}\n```")
+    if c.get("nearby_code"):
+        out.append(f"nearby code (numbered, '>' marks cursor line):\n```\n{c['nearby_code']}\n```")
+    if c.get("findings"):
+        out.append("current AI review findings in this file: " + "; ".join(c["findings"][:8]))
+    out.append("</vim-context>")
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
